@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI手势交互立体几何 - 二面角</title>
+    
+    <!-- 引入 Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    
+    <!-- 引入 Google MediaPipe 手势识别库 -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        /* 消除所有边距，防止黑边 */
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: #000; font-family: 'Segoe UI', Tahoma, Geneva, sans-serif; }
+        
+        /* 视频与画布层叠布局，使用 object-fit: cover 填满屏幕消除黑边 */
+        #video-element, #mp-canvas, #three-canvas { 
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; 
+        }
+        #video-element { transform: scaleX(-1); z-index: 1; }
+        #mp-canvas { z-index: 2; pointer-events: none; }
+        #three-canvas { z-index: 3; pointer-events: none; }
+        
+        /* UI 面板 */
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 10; pointer-events: none; display: flex; flex-direction: column; justify-content: space-between; }
+        
+        /* 将背景调整为透明，去掉边框，增加文字阴影保证清晰度 */
+        .panel { 
+            background: transparent; 
+            color: white; 
+            padding: 15px 20px; 
+            margin: 20px; 
+            pointer-events: auto; 
+            text-shadow: 0px 2px 4px rgba(0,0,0,0.9), 0px 0px 8px rgba(0,0,0,0.6); 
+        }
+        
+        #instructions { font-size: 16px; line-height: 1.8; }
+        .gesture-icon { display: inline-block; font-size: 20px; margin-right: 5px; text-shadow: none; } 
+        
+        #status-panel { display: flex; justify-content: space-between; align-items: center; }
+        #angle-display { font-size: 26px; font-weight: bold; color: #ffeb3b; }
+        #action-status { font-weight: bold; font-size: 18px; color: #fff; transition: color 0.3s; }
+
+        /* 加载与错误屏幕 */
+        #loading { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: #111; color: white; display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 999; text-align: center; }
+        .spinner { border: 4px solid rgba(255,255,255,0.1); border-top: 4px solid #00ffcc; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin-bottom: 20px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+
+    <!-- 加载动画 -->
+    <div id="loading">
+        <div class="spinner" id="spinner"></div>
+        <h2 id="loading-title">正在极速加载 AI 引擎...</h2>
+        <p id="loading-desc" style="color: #aaa; margin-top: 10px;">请允许浏览器/软件使用摄像头</p>
+    </div>
+
+    <!-- 媒体层 -->
+    <video id="video-element" autoplay playsinline></video>
+    <canvas id="mp-canvas"></canvas>
+    
+    <!-- UI层 -->
+    <div id="ui-layer">
+        <div id="instructions" class="panel">
+            <b>🤖 AI 手势操作指南 (自动锁定最近的手)：</b><br>
+            <span class="gesture-icon">🖐</span> <b>五指张开并移动：</b> 控制模型在空间中全方位旋转<br>
+            <span class="gesture-icon">🤏</span> <b>拇指与食指捏合/张开：</b> 实时调整二面角的度数 (0° - 180°)<br>
+        </div>
+        <div id="status-panel" class="panel">
+            <div id="angle-display">二面角: 60.0°</div>
+            <div id="action-status">状态: 等待摄像头...</div>
+        </div>
+    </div>
+
+    <script>
+        // --- 全局变量 ---
+        const videoElement = document.getElementById('video-element');
+        const mpCanvas = document.getElementById('mp-canvas');
+        const mpCtx = mpCanvas.getContext('2d');
+        
+        // Three.js 变量
+        let scene, camera, renderer;
+        let modelGroup, hingeBeta;
+        
+        // 交互状态 
+        let targetAngle = Math.PI / 3;
+        let currentAngle = Math.PI / 3;
+        let targetRotationX = Math.PI / 6;
+        let targetRotationY = -Math.PI / 4;
+        let currentRotationX = Math.PI / 6;
+        let currentRotationY = -Math.PI / 4;
+
+        // --- 1. 初始化 Three.js 3D 场景 ---
+        function initThreeJS() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 0, 8);
+            
+            renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.domElement.id = 'three-canvas';
+            document.body.appendChild(renderer.domElement);
+
+            scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+            let dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+            dirLight.position.set(5, 5, 5);
+            scene.add(dirLight);
+
+            buildGeometry();
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                mpCanvas.width = window.innerWidth;
+                mpCanvas.height = window.innerHeight;
+            });
+        }
+
+        function buildGeometry() {
+            modelGroup = new THREE.Group();
+            scene.add(modelGroup);
+            const planeSize = 3;
+
+            let edgeGeom = new THREE.CylinderGeometry(0.04, 0.04, planeSize + 1, 16);
+            edgeGeom.rotateZ(Math.PI / 2);
+            let edgeMat = new THREE.MeshLambertMaterial({ color: 0xff4757 });
+            let edge = new THREE.Mesh(edgeGeom, edgeMat);
+            modelGroup.add(edge);
+            modelGroup.add(makeTextSprite("l", new THREE.Vector3(planeSize/2 + 0.6, 0.2, 0), 50, "#ff4757"));
+
+            let planeGeom = new THREE.PlaneGeometry(planeSize, planeSize);
+            planeGeom.translate(0, planeSize / 2, 0); 
+            planeGeom.rotateX(-Math.PI / 2); 
+            let alphaMat = new THREE.MeshLambertMaterial({ color: 0x1e90ff, transparent: true, opacity: 0.6, side: THREE.DoubleSide });
+            let planeAlpha = new THREE.Mesh(planeGeom, alphaMat);
+            modelGroup.add(planeAlpha);
+            modelGroup.add(makeTextSprite("平面 α", new THREE.Vector3(1, 0.1, planeSize - 0.5), 40));
+
+            hingeBeta = new THREE.Group();
+            let betaMat = new THREE.MeshLambertMaterial({ color: 0x2ed573, transparent: true, opacity: 0.6, side: THREE.DoubleSide });
+            let planeBeta = new THREE.Mesh(planeGeom, betaMat);
+            
+            hingeBeta.add(planeBeta);
+            hingeBeta.add(makeTextSprite("平面 β", new THREE.Vector3(1, 0.1, planeSize - 0.5), 40));
+            modelGroup.add(hingeBeta);
+        }
+
+        function makeTextSprite(message, position, fontsize = 30, color = "white") {
+            let canvas = document.createElement('canvas');
+            canvas.width = 256; canvas.height = 128;
+            let ctx = canvas.getContext('2d');
+            ctx.font = "Bold " + fontsize + "px Arial";
+            ctx.fillStyle = color;
+            ctx.textAlign = "center"; ctx.textBaseline = "middle";
+            ctx.shadowColor = "black"; ctx.shadowBlur = 4;
+            ctx.fillText(message, 128, 64);
+            let texture = new THREE.CanvasTexture(canvas);
+            let sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, depthTest: false }));
+            sprite.position.copy(position);
+            sprite.scale.set(2, 1, 1);
+            return sprite;
+        }
+
+        const getDist = (p1, p2) => Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+
+        function getHandSize(landmarks) {
+            return getDist(landmarks[0], landmarks[12]);
+        }
+
+        function isHandOpen(landmarks) {
+            const d1 = getDist(landmarks[8], landmarks[12]); 
+            const d2 = getDist(landmarks[12], landmarks[16]); 
+            const d3 = getDist(landmarks[16], landmarks[20]); 
+            const wrist = landmarks[0];
+            const isIndexExtended = getDist(wrist, landmarks[8]) > getDist(wrist, landmarks[5]);
+            const isMiddleExtended = getDist(wrist, landmarks[12]) > getDist(wrist, landmarks[9]);
+            return (d1 > 0.035 && d2 > 0.035 && d3 > 0.03 && isIndexExtended && isMiddleExtended);
+        }
+
+        // --- 3. 初始化 MediaPipe 手势识别 ---
+        function initMediaPipe() {
+            mpCanvas.width = window.innerWidth;
+            mpCanvas.height = window.innerHeight;
+
+            const hands = new Hands({locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }});
+
+            hands.setOptions({
+                maxNumHands: 4, 
+                modelComplexity: 0, 
+                minDetectionConfidence: 0.6,
+                minTrackingConfidence: 0.5
+            });
+
+            hands.onResults(onHandResults);
+
+            const cameraMedia = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({image: videoElement});
+                },
+                width: 640, 
+                height: 480
+            });
+            
+            // 改进：增加对摄像头拒绝权限的错误捕获
+            cameraMedia.start()
+                .then(() => {
+                    document.getElementById('loading').style.display = 'none';
+                    document.getElementById('action-status').innerText = "状态: 寻找手势...";
+                })
+                .catch((error) => {
+                    console.error("摄像头启动失败:", error);
+                    document.getElementById('spinner').style.display = 'none';
+                    document.getElementById('loading-title').innerHTML = "❌ 无法访问摄像头";
+                    document.getElementById('loading-title').style.color = "#ff4757";
+                    document.getElementById('loading-desc').innerHTML = `
+                        检测到权限被拒绝 (Permission denied)。<br><br>
+                        请检查 Windows 系统设置或软件权限，<br>
+                        确保允许应用访问相机，然后刷新重试。<br><br>
+                        <span style="font-size:12px;color:#666;">错误信息: ${error.message}</span>
+                    `;
+                });
+        }
+
+        function onHandResults(results) {
+            mpCtx.save();
+            mpCtx.clearRect(0, 0, mpCanvas.width, mpCanvas.height);
+            mpCtx.scale(-1, 1);
+            mpCtx.translate(-mpCanvas.width, 0);
+
+            const actionStatusEl = document.getElementById('action-status');
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                let closestHand = null;
+                let maxSize = 0;
+                
+                for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+                    let size = getHandSize(results.multiHandLandmarks[i]);
+                    if (size > maxSize) {
+                        maxSize = size;
+                        closestHand = results.multiHandLandmarks[i];
+                    }
+                }
+
+                if (closestHand) {
+                    drawConnectors(mpCtx, closestHand, HAND_CONNECTIONS, {color: '#00ffcc', lineWidth: 3});
+                    drawLandmarks(mpCtx, closestHand, {color: '#ff4757', lineWidth: 1, radius: 4});
+
+                    const thumbTip = closestHand[4];
+                    const indexTip = closestHand[8];
+                    const wrist = closestHand[0];
+
+                    let pinchDist = getDist(thumbTip, indexTip);
+                    let mappedAngle = (pinchDist - 0.02) / (0.15 - 0.02) * 180;
+                    mappedAngle = Math.max(0, Math.min(180, mappedAngle)); 
+                    targetAngle = mappedAngle * Math.PI / 180;
+
+                    if (isHandOpen(closestHand)) {
+                        targetRotationY = (wrist.x - 0.5) * -Math.PI * 1.5;
+                        targetRotationX = (wrist.y - 0.5) * Math.PI * 1.5;
+                        actionStatusEl.innerText = "状态: 🟢 旋转模型中";
+                        actionStatusEl.style.color = "#00ffcc";
+                    } else {
+                        actionStatusEl.innerText = "状态: 🟡 调整角度/静止";
+                        actionStatusEl.style.color = "#ffeb3b";
+                    }
+                }
+            } else {
+                actionStatusEl.innerText = "状态: 寻找手势...";
+                actionStatusEl.style.color = "#fff";
+            }
+            mpCtx.restore();
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            currentAngle += (targetAngle - currentAngle) * 0.15;
+            currentRotationX += (targetRotationX - currentRotationX) * 0.1;
+            currentRotationY += (targetRotationY - currentRotationY) * 0.1;
+
+            if (modelGroup) {
+                modelGroup.rotation.x = currentRotationX;
+                modelGroup.rotation.y = currentRotationY;
+                hingeBeta.rotation.x = currentAngle;
+                document.getElementById('angle-display').innerText = `二面角: ${(currentAngle * 180 / Math.PI).toFixed(1)}°`;
+            }
+            renderer.render(scene, camera);
+        }
+
+        initThreeJS();
+        initMediaPipe();
+        animate();
+    </script>
+</body>
+</html>
